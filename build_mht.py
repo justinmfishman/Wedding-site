@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
-"""Generate .mht files from the static wedding site pages."""
+"""Generate .mht files from the static wedding site pages.
+
+Uses Content-ID (cid:) references so browsers can resolve assets
+within the MIME archive. Matches the format Chrome/Edge produce
+when saving as "Webpage, Single File (.mht)".
+"""
 
 import base64
 import os
 import re
-from email.mime.base import MIMEBase
+import uuid
 from pathlib import Path
 
 SITE_DIR = Path("/home/user/Wedding-site")
 OUTPUT_DIR = SITE_DIR / "mht_output"
-BOUNDARY = "----=_NextPart_Wedding_Site"
+BOUNDARY = "----MultipartBoundary--WeddingSite" + uuid.uuid4().hex[:12]
 
 PAGES = [
     ("index.html", "Justin & Jen - Home"),
@@ -32,28 +37,46 @@ MIME_TYPES = {
     ".jpeg": "image/jpeg",
 }
 
+# Base URL used for Content-Location headers
+BASE_URL = "https://wedding.local"
+
 
 def get_mime_type(filepath):
     ext = Path(filepath).suffix.lower()
     return MIME_TYPES.get(ext, "application/octet-stream")
 
 
-def encode_file(filepath):
+def make_cid(asset_ref):
+    """Create a deterministic Content-ID from an asset path."""
+    safe = asset_ref.replace("/", "-").replace(".", "-")
+    return f"{safe}@mhtml.blink"
+
+
+def encode_file_b64(filepath):
     with open(filepath, "rb") as f:
-        return base64.b64encode(f.read()).decode("ascii")
+        raw = base64.b64encode(f.read()).decode("ascii")
+    # Wrap at 76 chars per RFC 2045
+    return "\n".join(raw[i:i+76] for i in range(0, len(raw), 76))
 
 
-def find_referenced_assets(html_content):
-    """Extract all local file references from HTML."""
-    assets = set()
-    # Match src="..." and href="..." for local files
-    for attr in ["src", "href"]:
-        pattern = rf'{attr}="([^"]*?)"'
-        for match in re.finditer(pattern, html_content):
-            ref = match.group(1)
-            if not ref.startswith(("http://", "https://", "#", "mailto:")):
-                assets.add(ref)
-    return assets
+def find_local_refs(html_content):
+    """Find all local src/href references."""
+    refs = set()
+    for attr in ("src", "href"):
+        for m in re.finditer(rf'{attr}="([^"]*?)"', html_content):
+            ref = m.group(1)
+            if ref and not ref.startswith(("http://", "https://", "#", "mailto:", "javascript:")):
+                refs.add(ref)
+    return refs
+
+
+def rewrite_html(html_content, asset_refs):
+    """Replace local asset paths with cid: URIs."""
+    rewritten = html_content
+    for ref in asset_refs:
+        cid = make_cid(ref)
+        rewritten = rewritten.replace(f'"{ref}"', f'"cid:{cid}"')
+    return rewritten
 
 
 def build_mht(html_file, title):
@@ -61,61 +84,99 @@ def build_mht(html_file, title):
     with open(html_path, "r", encoding="utf-8") as f:
         html_content = f.read()
 
-    # Rewrite local refs to use content-location style paths
-    assets = find_referenced_assets(html_content)
+    # Collect referenced assets
+    asset_refs = find_local_refs(html_content)
+
+    # Inline the CSS directly into the HTML to avoid cross-file issues
+    css_path = SITE_DIR / "css" / "style.css"
+    js_path = SITE_DIR / "js" / "main.js"
+
+    # Read CSS and JS
+    css_content = ""
+    if css_path.exists():
+        with open(css_path, "r") as f:
+            css_content = f.read()
+
+    js_content = ""
+    if js_path.exists():
+        with open(js_path, "r") as f:
+            js_content = f.read()
+
+    # Replace CSS link with inline style
+    html_content = re.sub(
+        r'<link\s+rel="stylesheet"\s+href="css/style\.css"\s*/?>',
+        f"<style>\n{css_content}\n</style>",
+        html_content
+    )
+
+    # Replace JS script src with inline script
+    html_content = re.sub(
+        r'<script\s+src="js/main\.js"\s*></script>',
+        f"<script>\n{js_content}\n</script>",
+        html_content
+    )
+
+    # Remove css/js from asset refs since they're now inlined
+    asset_refs.discard("css/style.css")
+    asset_refs.discard("js/main.js")
+
+    # Also discard references to other HTML pages (nav links)
+    asset_refs = {r for r in asset_refs if not r.endswith(".html")}
+
+    # Rewrite remaining refs (images) to cid:
+    html_content = rewrite_html(html_content, asset_refs)
+
+    # -- Build MIME parts --
+    page_url = f"{BASE_URL}/{html_file}"
 
     parts = []
 
-    # --- HTML part ---
-    location = f"file:///{html_file}"
+    # HTML part
     parts.append(
-        f"Content-Type: text/html; charset=\"utf-8\"\n"
-        f"Content-Transfer-Encoding: quoted-printable\n"
-        f"Content-Location: {location}\n"
-        f"\n"
+        f"Content-Type: text/html; charset=\"utf-8\"\r\n"
+        f"Content-Transfer-Encoding: quoted-printable\r\n"
+        f"Content-Location: {page_url}\r\n"
+        f"\r\n"
         f"{html_content}"
     )
 
-    # --- Asset parts ---
-    for asset_ref in sorted(assets):
-        asset_path = SITE_DIR / asset_ref
+    # Image parts
+    for ref in sorted(asset_refs):
+        asset_path = SITE_DIR / ref
         if not asset_path.exists():
-            print(f"  Warning: {asset_ref} not found, skipping")
+            print(f"  Warning: {ref} not found, skipping")
             continue
 
-        mime = get_mime_type(asset_ref)
-        encoded = encode_file(asset_path)
-
-        # Wrap base64 at 76 chars
-        wrapped = "\n".join(
-            encoded[i : i + 76] for i in range(0, len(encoded), 76)
-        )
+        mime = get_mime_type(ref)
+        cid = make_cid(ref)
+        b64 = encode_file_b64(asset_path)
 
         parts.append(
-            f"Content-Type: {mime}\n"
-            f"Content-Transfer-Encoding: base64\n"
-            f"Content-Location: {asset_ref}\n"
-            f"\n"
-            f"{wrapped}"
+            f"Content-Type: {mime}\r\n"
+            f"Content-Transfer-Encoding: base64\r\n"
+            f"Content-ID: <{cid}>\r\n"
+            f"Content-Location: {BASE_URL}/{ref}\r\n"
+            f"\r\n"
+            f"{b64}"
         )
 
-    # --- Assemble MHT ---
+    # Assemble
     mht = (
-        f"From: <Saved by Claude>\n"
-        f"Subject: {title}\n"
-        f"MIME-Version: 1.0\n"
-        f"Content-Type: multipart/related;\n"
-        f"\tboundary=\"{BOUNDARY}\";\n"
-        f"\ttype=\"text/html\"\n"
-        f"\n"
-        f"This is a multi-part message in MIME format.\n"
-        f"\n"
+        f"From: <Saved by Claude>\r\n"
+        f"Snapshot-Content-Location: {page_url}\r\n"
+        f"Subject: {title}\r\n"
+        f"MIME-Version: 1.0\r\n"
+        f"Content-Type: multipart/related;\r\n"
+        f"\ttype=\"text/html\";\r\n"
+        f"\tboundary=\"{BOUNDARY}\"\r\n"
+        f"\r\n"
+        f"\r\n"
     )
 
     for part in parts:
-        mht += f"--{BOUNDARY}\n{part}\n\n"
+        mht += f"--{BOUNDARY}\r\n{part}\r\n\r\n"
 
-    mht += f"--{BOUNDARY}--\n"
+    mht += f"--{BOUNDARY}--\r\n"
     return mht
 
 
@@ -126,12 +187,10 @@ def main():
         print(f"Building: {title} ({html_file})")
         mht_content = build_mht(html_file, title)
 
-        # Output filename
-        stem = Path(html_file).stem
         out_name = f"{title.replace(' - ', ' _ ')}.mht"
         out_path = OUTPUT_DIR / out_name
 
-        with open(out_path, "w", encoding="utf-8") as f:
+        with open(out_path, "w", encoding="utf-8", newline="") as f:
             f.write(mht_content)
 
         size_kb = os.path.getsize(out_path) / 1024
